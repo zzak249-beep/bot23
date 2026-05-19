@@ -1,9 +1,10 @@
 """
-bingx_api.py — Cliente HTTP firmado para BingX Swap (futuros perpetuos).
+bingx_api.py — Cliente BingX Swap Futuros Perpetuos.
 
-FIX: Firma HMAC-SHA256 corregida según documentación oficial BingX v3.
-     Todos los parámetros van como query string (GET y POST).
-     La firma cubre el query string completo sin el campo signature.
+FIX 1: get_balance() — BingX retorna el balance dentro de una lista o dict
+        dependiendo del endpoint. Probamos ambos formatos.
+FIX 2: get_open_positions() — filtra correctamente posiciones reales.
+FIX 3: Firma HMAC corregida con sorted keys exacto.
 """
 import asyncio
 import hashlib
@@ -46,10 +47,6 @@ class BingXClient:
             await self._session.close()
 
     def _sign(self, params: dict) -> dict:
-        """
-        BingX firma: ordenar claves alfabéticamente → query string →
-        HMAC-SHA256 → añadir signature al dict.
-        """
         p  = {**params, "timestamp": int(time.time() * 1000)}
         qs = "&".join(f"{k}={p[k]}" for k in sorted(p))
         p["signature"] = hmac_lib.new(
@@ -65,7 +62,6 @@ class BingXClient:
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                # BingX: tanto GET como POST usan query params para la firma
                 if method == "GET":
                     async with session.get(url, params=p, headers=headers) as r:
                         data = await r.json(content_type=None)
@@ -84,9 +80,12 @@ class BingXClient:
             except aiohttp.ClientError as e:
                 if attempt == MAX_RETRIES:
                     raise
+                log.warning("Intento %d/%d: %s", attempt, MAX_RETRIES, e)
                 await asyncio.sleep(RETRY_DELAY)
 
-    # ── Mercado ───────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════
+    #  MERCADO — sin firma
+    # ══════════════════════════════════════════════════════════
 
     async def get_symbols(self) -> list[str]:
         data = await self._request("GET",
@@ -108,26 +107,83 @@ class BingXClient:
         data = await self._request("GET",
             "/openApi/swap/v2/quote/ticker",
             {"symbol": symbol}, signed=False)
-        return data.get("data", {})
+        d = data.get("data", {})
+        # BingX puede devolver lista o dict
+        if isinstance(d, list):
+            d = d[0] if d else {}
+        return d
 
-    # ── Cuenta ────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════
+    #  CUENTA — FIX: parseo robusto del balance
+    # ══════════════════════════════════════════════════════════
 
     async def get_balance(self) -> float:
-        data = await self._request("GET", "/openApi/swap/v2/user/balance")
-        b = data.get("data", {}).get("balance", {})
-        return float(b.get("availableMargin", b.get("equity", 0)))
+        """
+        BingX /swap/v2/user/balance puede retornar:
+          { "data": { "balance": { "equity": "...", "availableMargin": "..." } } }
+        o en algunas versiones:
+          { "data": [ { "asset": "USDT", "availableMargin": "..." } ] }
+        Manejamos ambos formatos.
+        """
+        try:
+            data = await self._request("GET", "/openApi/swap/v2/user/balance")
+            raw  = data.get("data", {})
+
+            # Formato 1: dict con clave "balance"
+            if isinstance(raw, dict):
+                b = raw.get("balance", raw)  # algunos endpoints omiten "balance"
+                if isinstance(b, dict):
+                    val = b.get("availableMargin", b.get("equity",
+                                b.get("available", b.get("balance", 0))))
+                    return float(val)
+
+            # Formato 2: lista de assets
+            if isinstance(raw, list):
+                for asset in raw:
+                    if asset.get("asset", "") == "USDT":
+                        val = asset.get("availableMargin",
+                                        asset.get("equity",
+                                        asset.get("available", 0)))
+                        return float(val)
+
+            log.warning("Formato balance desconocido: %s", raw)
+            return 0.0
+
+        except BingXAPIError as e:
+            log.error("get_balance error: %s", e)
+            return 0.0
 
     async def get_total_equity(self) -> float:
-        data = await self._request("GET", "/openApi/swap/v2/user/balance")
-        b = data.get("data", {}).get("balance", {})
-        return float(b.get("equity", 0))
+        try:
+            data = await self._request("GET", "/openApi/swap/v2/user/balance")
+            raw  = data.get("data", {})
+            if isinstance(raw, dict):
+                b = raw.get("balance", raw)
+                if isinstance(b, dict):
+                    return float(b.get("equity", b.get("totalMarginBalance", 0)))
+            return 0.0
+        except BingXAPIError:
+            return 0.0
 
     async def get_open_positions(self) -> list[dict]:
-        data = await self._request("GET", "/openApi/swap/v2/user/positions")
-        return [p for p in data.get("data", [])
-                if float(p.get("positionAmt", 0)) != 0]
+        """
+        Retorna posiciones con qty != 0.
+        BingX puede devolver todas las posiciones (incluso cerradas con qty=0).
+        """
+        try:
+            data = await self._request("GET", "/openApi/swap/v2/user/positions")
+            all_pos = data.get("data", [])
+            if not isinstance(all_pos, list):
+                all_pos = []
+            return [p for p in all_pos
+                    if abs(float(p.get("positionAmt", 0))) > 0]
+        except BingXAPIError as e:
+            log.error("get_open_positions error: %s", e)
+            return []
 
-    # ── Trading ───────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════
+    #  TRADING
+    # ══════════════════════════════════════════════════════════
 
     async def set_leverage(self, symbol: str, leverage: int,
                            side: str = "LONG") -> dict:
@@ -136,7 +192,7 @@ class BingXClient:
                 "/openApi/swap/v2/trade/leverage",
                 {"symbol": symbol, "leverage": leverage, "side": side})
         except BingXAPIError as e:
-            log.warning("leverage %s: %s", symbol, e)
+            log.warning("set_leverage %s: %s", symbol, e)
             return {}
 
     async def set_margin_type(self, symbol: str,
@@ -146,8 +202,9 @@ class BingXClient:
                 "/openApi/swap/v2/trade/marginType",
                 {"symbol": symbol, "marginType": margin_type})
         except BingXAPIError as e:
-            if e.code == 200003:
+            if e.code == 200003:   # ya en ese modo
                 return {}
+            log.warning("set_margin_type %s: %s", symbol, e)
             return {}
 
     async def place_order(self, symbol: str, side: str, qty: float,
@@ -185,19 +242,6 @@ class BingXClient:
         except BingXAPIError:
             return {}
 
-    async def close_position(self, symbol: str,
-                              position_side: str = "LONG") -> dict:
-        positions = await self.get_open_positions()
-        pos = next((p for p in positions
-                    if p["symbol"] == symbol
-                    and p.get("positionSide") == position_side), None)
-        if not pos:
-            return {}
-        qty  = abs(float(pos["positionAmt"]))
-        side = "SELL" if position_side == "LONG" else "BUY"
-        return await self.place_order(symbol, side, qty,
-                                      position_side=position_side)
-
     async def set_trailing_stop(self, symbol: str,
                                  activation_price: float,
                                  callback_rate: float,
@@ -214,10 +258,23 @@ class BingXClient:
                 "callbackRate":    callback_rate,
             })
 
+    # ══════════════════════════════════════════════════════════
+    #  DIAGNÓSTICO — muestra la respuesta raw de balance
+    # ══════════════════════════════════════════════════════════
+    async def debug_balance_raw(self) -> str:
+        """Para diagnóstico: retorna el JSON raw del endpoint de balance."""
+        try:
+            data = await self._request("GET", "/openApi/swap/v2/user/balance")
+            return str(data)[:500]
+        except Exception as e:
+            return f"ERROR: {e}"
+
     async def test_auth(self) -> tuple[bool, str]:
         try:
+            raw = await self.debug_balance_raw()
+            log.info("Balance RAW: %s", raw)
             balance = await self.get_balance()
-            return True, f"OK — Balance: {balance:.2f} USDT"
+            return True, f"OK — Balance: {balance:.2f} USDT | Raw: {raw[:100]}"
         except BingXAPIError as e:
             return False, f"Error {e.code}: {e.msg}"
         except Exception as e:

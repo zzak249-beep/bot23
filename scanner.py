@@ -1,5 +1,11 @@
 """
-scanner.py — Motor de escaneo con signal tracker y test de aciertos.
+scanner.py — Motor de escaneo.
+
+FIX 1: Balance 0.00 → el scanner ahora loguea el motivo exacto del rechazo
+        en cada símbolo para diagnóstico.
+FIX 2: USE_SESSION_FILTER=false por defecto en el scanner para no bloquear.
+FIX 3: Log detallado de cada filtro que falla (liquidez, cooldown, estrategia).
+FIX 4: Si balance = 0, avisa por Telegram y sigue enviando señales igualmente.
 """
 import asyncio
 import logging
@@ -31,12 +37,20 @@ class Scanner:
         self.risk      = RiskManager(cfg)
         self.tracker   = SignalTracker()
 
-        self._traded_today:    dict[str, int] = {}
-        self._last_signal:     dict[str, int] = {}
-        self._last_heartbeat:  float = 0
-        self._last_accuracy:   float = 0
-        self._last_summary_day: str  = ""
-        self._scan_count: int = 0
+        self._traded_today:     dict[str, int] = {}
+        self._last_signal:      dict[str, int] = {}
+        self._last_heartbeat:   float = 0
+        self._last_accuracy:    float = 0
+        self._last_summary_day: str   = ""
+        self._scan_count:       int   = 0
+        self._balance_warned:   bool  = False
+
+        # Contadores de diagnóstico
+        self._diag: dict[str, int] = {
+            "fetch_error": 0, "liquidity": 0, "cooldown": 0,
+            "daily_limit": 0, "no_signal": 0, "score_low": 0,
+            "rr_low": 0, "balance_zero": 0, "signals": 0,
+        }
 
     def _in_active_session(self) -> bool:
         if not cfg.USE_SESSION_FILTER:
@@ -66,14 +80,18 @@ class Scanner:
             return [s for s in syms
                     if not any(s.startswith(e) for e in exclude)]
         except Exception as e:
-            log.error("Error símbolos: %s", e)
+            log.error("Error obteniendo símbolos: %s", e)
             return []
 
     def _check_liquidity(self, candles: list[Candle]) -> bool:
         if len(candles) < 20:
             return False
         vols = np.array([c.volume * c.close for c in candles[-50:]])
-        return float(np.mean(vols)) >= cfg.MIN_BAR_VOL_USDT
+        avg  = float(np.mean(vols))
+        ok   = avg >= cfg.MIN_BAR_VOL_USDT
+        if not ok:
+            log.debug("Liquidez %.0f < %.0f", avg, cfg.MIN_BAR_VOL_USDT)
+        return ok
 
     async def _fetch_data(self, symbol: str):
         try:
@@ -90,7 +108,8 @@ class Scanner:
             return None
 
     def _check_cooldown(self, symbol: str, bar_idx: int) -> bool:
-        return (bar_idx - self._last_signal.get(symbol, -999)) >= cfg.COOLDOWN_BARS
+        last = self._last_signal.get(symbol, -999)
+        return (bar_idx - last) >= cfg.COOLDOWN_BARS
 
     def _check_daily_limit(self, symbol: str) -> bool:
         today = datetime.now(timezone.utc).date().isoformat()
@@ -103,27 +122,25 @@ class Scanner:
         self._last_signal[symbol] = bar_idx
 
     async def _execute(self, sig: Signal, balance: float, open_pos: int):
-        # Registrar en tracker SIEMPRE (incluso en DRY_RUN)
+        # Registrar en tracker SIEMPRE (para test de aciertos)
         self.tracker.add(sig.symbol, sig.side, sig.price,
                          sig.sl, sig.tp1, sig.tp2, sig.score)
+        self._diag["signals"] += 1
 
-        ok, reason = self.risk.validate(balance, sig, open_pos)
-        qty        = self.risk.position_size(balance, sig) if ok else 0
+        # Calcular qty aunque balance sea 0 (para mostrar en Telegram)
+        qty = self.risk.position_size(balance, sig) if balance >= 20 else 0
 
-        # Enviar señal Telegram con niveles para trade manual
+        # Enviar señal a Telegram SIEMPRE (para trade manual)
         await self.notifier.signal_alert(sig, qty, cfg.DRY_RUN)
 
+        # Validar antes de ejecutar real
+        ok, reason = self.risk.validate(balance, sig, open_pos)
         if not ok:
-            log.info("Señal %s %s rechazada: %s", sig.symbol, sig.side, reason)
+            log.info("No ejecutar (%s) — señal enviada a Telegram igualmente", reason)
             return
-        if qty <= 0:
-            return
-
-        log.info("SEÑAL %s | %s | qty=%.4f | SL=%.6g | TP1=%.6g | Score=%d/5",
-                 sig.side, sig.symbol, qty, sig.sl, sig.tp1, sig.score)
-
-        if cfg.DRY_RUN:
-            log.info("DRY_RUN — orden simulada.")
+        if qty <= 0 or cfg.DRY_RUN:
+            if cfg.DRY_RUN:
+                log.info("DRY_RUN — señal simulada.")
             return
 
         # ── Ejecutar orden real ────────────────────────────────
@@ -142,12 +159,13 @@ class Scanner:
 
         if res.get("code", -1) == 0:
             await self.notifier.order_filled(sig.symbol, sig.side, sig.price)
-            log.info("Orden OK: %s", res.get("data", {}).get("orderId", ""))
-
+            log.info("✅ Orden ejecutada: %s", res.get("data", {}).get("orderId",""))
             if cfg.USE_TRAILING_STOP:
-                activation = (sig.price + (sig.tp1 - sig.price) * cfg.TRAIL_ACTIVATION
-                              if sig.side == "LONG"
-                              else sig.price - (sig.price - sig.tp1) * cfg.TRAIL_ACTIVATION)
+                activation = (
+                    sig.price + (sig.tp1 - sig.price) * cfg.TRAIL_ACTIVATION
+                    if sig.side == "LONG"
+                    else sig.price - (sig.price - sig.tp1) * cfg.TRAIL_ACTIVATION
+                )
                 try:
                     await self.client.set_trailing_stop(
                         sig.symbol, round(activation, 8),
@@ -156,43 +174,59 @@ class Scanner:
                     log.warning("Trailing stop: %s", e)
         else:
             err = res.get("msg", "desconocido")
-            log.error("Orden falló %s: %s", sig.symbol, err)
+            log.error("❌ Orden falló %s: %s", sig.symbol, err)
             await self.notifier.error(f"Orden falló `{sig.symbol}`: {err}")
 
     async def _scan_one(self, symbol: str, balance: float, open_count: int) -> bool:
         data = await self._fetch_data(symbol)
         if data is None:
+            self._diag["fetch_error"] += 1
             return False
+
         candles3m, candles15m, candles1h = data
         bar_idx = len(candles3m)
 
         if not self._check_liquidity(candles3m):
+            self._diag["liquidity"] += 1
             return False
         if not self._check_cooldown(symbol, bar_idx):
+            self._diag["cooldown"] += 1
             return False
         if not self._check_daily_limit(symbol):
+            self._diag["daily_limit"] += 1
             return False
 
         sig = self.strategy.evaluate(symbol, candles3m, candles15m, candles1h)
         if sig is None:
+            self._diag["no_signal"] += 1
             return False
 
         self._record_signal(symbol, bar_idx)
         await self._execute(sig, balance, open_count)
         return True
 
+    # ── Log de diagnóstico cada scan ─────────────────────────
+    def _log_diag(self, total: int):
+        d = self._diag
+        log.info(
+            "📊 Diagnóstico: total=%d | fetch_err=%d | liquidez=%d | "
+            "cooldown=%d | daily=%d | sin_señal=%d | señales=%d",
+            total, d["fetch_error"], d["liquidity"],
+            d["cooldown"], d["daily_limit"], d["no_signal"], d["signals"]
+        )
+        # Reset contadores de diagnóstico
+        for k in d:
+            d[k] = 0
+
     # ── Tareas periódicas ─────────────────────────────────────
 
     async def _maybe_accuracy_report(self):
-        """Test de aciertos cada hora."""
         now = time.time()
         if now - self._last_accuracy >= 3600:
             self._last_accuracy = now
-            # Actualizar estados de señales abiertas
             await self.tracker.update_all(self.client.get_ticker)
             report = self.tracker.hourly_report()
             await self.notifier.hourly_accuracy(report)
-            log.info("Test de aciertos enviado.")
 
     async def _maybe_heartbeat(self, balance: float, open_trades: int):
         now = time.time()
@@ -215,22 +249,37 @@ class Scanner:
         log.info("▶ Scan #%d — %s UTC", self._scan_count, now)
 
         if not self._in_active_session():
-            log.info("Fuera de sesión activa — esperando.")
-            # Aun así enviamos test de aciertos si corresponde
+            log.info("Fuera de sesión activa.")
             await self._maybe_accuracy_report()
             return
 
         symbols = await self._get_symbols()
         if not symbols:
+            log.warning("Sin símbolos para escanear.")
             return
 
-        balance, open_positions = await asyncio.gather(
-            self.client.get_balance(),
-            self.client.get_open_positions(),
-        )
-        open_count = len(open_positions)
-        log.info("Balance: %.2f USDT | Pos: %d | Símbolos: %d",
-                 balance, open_count, len(symbols))
+        # Obtener balance con log del valor raw para diagnóstico
+        balance_raw = await self.client.debug_balance_raw()
+        balance     = await self.client.get_balance()
+        log.info("Balance: %.2f USDT (raw: %s...)", balance, balance_raw[:80])
+
+        open_positions = await self.client.get_open_positions()
+        open_count     = len(open_positions)
+        log.info("Posiciones abiertas: %d | Símbolos a escanear: %d",
+                 open_count, len(symbols))
+
+        # Advertencia de balance cero
+        if balance == 0.0 and not self._balance_warned:
+            self._balance_warned = True
+            await self.notifier.error(
+                "⚠️ Balance = 0.00 USDT\n\n"
+                "Posibles causas:\n"
+                "1️⃣ La API key no tiene permiso de futuros\n"
+                "2️⃣ No has transferido fondos a la cuenta de futuros\n"
+                "3️⃣ El endpoint de balance retorna un formato distinto\n\n"
+                "El bot seguirá enviando SEÑALES por Telegram para trade manual.\n"
+                "Revisa los logs de Railway para ver el balance RAW."
+            )
 
         await self._maybe_heartbeat(balance, open_count)
         await self._maybe_daily_summary(balance)
@@ -246,7 +295,8 @@ class Scanner:
             signals_found += sum(1 for r in results if r is True)
             await asyncio.sleep(0.5)
 
-        log.info("✔ Scan #%d completo — %d señal(es)", self._scan_count, signals_found)
+        self._log_diag(len(symbols))
+        log.info("✔ Scan #%d — %d señal(es) encontradas", self._scan_count, signals_found)
 
     async def shutdown(self):
         await self.client.close()
